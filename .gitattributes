@@ -1,0 +1,31 @@
+# Auto detect text files and ensure LF line endings
+* text=auto eol=lf
+
+# Go source files
+*.go text diff=golang
+
+# Documentation
+*.md text diff=markdown
+
+# Config files
+*.toml text
+*.yml text
+*.yaml text
+*.json text
+
+# Shell scripts
+*.sh text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.gif binary
+
+# Go module files
+go.sum text
+
+# Deny large binary blobs
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
