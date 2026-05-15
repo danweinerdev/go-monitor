@@ -2,6 +2,8 @@ package monitor
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -119,18 +121,20 @@ func TestMeasurementFilterValidateNamesPattern(t *testing.T) {
 	if err == nil {
 		t.Fatal("Validate() = nil, want error")
 	}
-	if got := err.Error(); !contains(got, "ba*d") {
+	if got := err.Error(); !strings.Contains(got, "ba*d") {
 		t.Errorf("Validate() error = %q, want it to name the offending pattern %q", got, "ba*d")
 	}
 }
 
-func contains(haystack, needle string) bool {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
+func TestMeasurementFilterValidateNilInner(t *testing.T) {
+	f := &MeasurementFilter{Include: []string{"cpu"}}
+	err := f.Validate()
+	if err == nil {
+		t.Fatal("Validate() = nil, want error for nil Inner")
 	}
-	return false
+	if got := err.Error(); !strings.Contains(got, "Inner") {
+		t.Errorf("Validate() error = %q, want it to mention the missing Inner", got)
+	}
 }
 
 func TestMeasurementFilterOutcomeRules(t *testing.T) {
@@ -253,14 +257,48 @@ func TestMeasurementFilterWriteEmptyResultSkipsInner(t *testing.T) {
 	}
 }
 
-func TestMeasurementFilterWriteEmptyBatchSkipsInner(t *testing.T) {
-	rec := &recordingBackend{name: "echo", healthy: true}
-	f := &MeasurementFilter{Inner: rec}
-
-	if err := f.Write(context.Background(), nil); err != nil {
-		t.Fatalf("Write() error: %v", err)
+func TestMeasurementFilterWritePropagatesInnerError(t *testing.T) {
+	wantErr := errors.New("inner backend write failed")
+	rec := &recordingBackend{name: "echo", healthy: true, writeErr: wantErr}
+	f := &MeasurementFilter{
+		Inner:   rec,
+		Include: []string{"cpu"},
 	}
-	if rec.writeCalls != 0 {
-		t.Errorf("Inner.Write called %d times, want 0 (empty batch)", rec.writeCalls)
+
+	ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	batch := []*Metric{
+		NewMetric("cpu").WithField("v", 1).WithTimestamp(ts),
+	}
+
+	err := f.Write(context.Background(), batch)
+	if rec.writeCalls != 1 {
+		t.Fatalf("Inner.Write called %d times, want 1 (batch passes filter)", rec.writeCalls)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("Write() error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestMeasurementFilterWriteEmptyBatchSkipsInner(t *testing.T) {
+	cases := []struct {
+		name  string
+		batch []*Metric
+	}{
+		{"nil batch", nil},
+		{"empty non-nil batch", []*Metric{}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recordingBackend{name: "echo", healthy: true}
+			f := &MeasurementFilter{Inner: rec}
+
+			if err := f.Write(context.Background(), tc.batch); err != nil {
+				t.Fatalf("Write() error: %v", err)
+			}
+			if rec.writeCalls != 0 {
+				t.Errorf("Inner.Write called %d times, want 0 (empty batch)", rec.writeCalls)
+			}
+		})
 	}
 }

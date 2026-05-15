@@ -59,11 +59,14 @@ func (f *MeasurementFilter) Healthy() bool {
 	return f.Inner.Healthy()
 }
 
-// Validate checks that every Include and Exclude pattern is well-formed. A
-// pattern is well-formed if it contains no '*', or if its only '*' is the
-// final character. It returns a non-nil error naming the first offending
-// pattern otherwise.
+// Validate checks that Inner is set and that every Include and Exclude pattern
+// is well-formed. A pattern is well-formed if it contains no '*', or if its
+// only '*' is the final character. It returns a non-nil error if Inner is nil
+// or naming the first offending pattern otherwise.
 func (f *MeasurementFilter) Validate() error {
+	if f.Inner == nil {
+		return fmt.Errorf("MeasurementFilter.Inner is required")
+	}
 	for _, p := range f.Include {
 		if err := validatePattern(p); err != nil {
 			return fmt.Errorf("invalid include pattern %q: %w", p, err)
