@@ -11,13 +11,13 @@ import (
 // recoverFakeBackend follows the real backend health contract: it forces
 // healthy=true at the top of every Write (the self-heal the real influxdb and
 // elasticsearch backends perform), and on its injected failure it sets
-// healthy=false and returns an error (mirroring markUnhealthy()). It fails the
-// first Write call, then succeeds on every subsequent call.
+// healthy=false and returns an error (mirroring markUnhealthy()). It fails its
+// first failFirstN Write calls, then succeeds on every subsequent call.
 type recoverFakeBackend struct {
-	mu       sync.Mutex
-	healthy  bool
-	calls    int
-	failFirN int // number of leading Write calls that should fail
+	mu         sync.Mutex
+	healthy    bool
+	calls      int
+	failFirstN int // number of leading Write calls that should fail
 }
 
 func (b *recoverFakeBackend) Name() string                         { return "recover-fake" }
@@ -32,7 +32,7 @@ func (b *recoverFakeBackend) Write(ctx context.Context, metrics []*Metric) error
 	b.healthy = true
 	b.calls++
 
-	if b.calls <= b.failFirN {
+	if b.calls <= b.failFirstN {
 		// Injected failure: mark unhealthy and return an error, exactly as
 		// the real backends do via markUnhealthy().
 		b.healthy = false
@@ -56,13 +56,20 @@ func (b *recoverFakeBackend) callCount() int {
 }
 
 // TestPipelineRecoverIntervalProbe is the regression test for the
-// health-state deadlock: once a backend goes unhealthy the pipeline must skip
-// it only until RecoverInterval elapses, then probe it again so it can
-// self-heal. This drives the exported Pipeline.Flush path (Push + Flush, the
-// same trigger the other pipeline tests use) and crosses RecoverInterval via
-// an injected clock so the test is deterministic and sleep-free.
+// health-state deadlock: once a backend goes unhealthy the pipeline must
+// probe it (immediately on the first post-failure flush, which starts the
+// cooldown clock), then skip it until RecoverInterval elapses, then probe it
+// again so it can self-heal. This drives the exported Pipeline.Flush path
+// (Push + Flush, the same trigger the other pipeline tests use) and crosses
+// RecoverInterval via an injected clock so the test is deterministic and
+// sleep-free.
 func TestPipelineRecoverIntervalProbe(t *testing.T) {
-	backend := &recoverFakeBackend{healthy: true, failFirN: 1}
+	// failFirstN: 2 so the first two Write calls fail. Call #1 is the healthy
+	// flush that knocks the backend unhealthy; call #2 is the immediate
+	// first post-failure recovery probe (which under the corrected contract
+	// happens on the very next flush and starts the cooldown clock). The
+	// backend recovers on call #3.
+	backend := &recoverFakeBackend{healthy: true, failFirstN: 2}
 
 	const recover = 30 * time.Second
 
@@ -110,35 +117,44 @@ func TestPipelineRecoverIntervalProbe(t *testing.T) {
 		t.Fatal("Flush #1: backend should be unhealthy after injected failure")
 	}
 
-	// --- Flush #2: clock NOT advanced. Backend is unhealthy and was just
-	// attempted, so it must be skipped: Write is NOT called again.
+	// --- Flush #2: clock NOT advanced. Backend is unhealthy; this is the
+	// FIRST flush since it went unhealthy, so it is also the first recovery
+	// probe. Under the corrected contract (the probe timestamp is recorded
+	// only on an actual unhealthy-backend probe, never on a healthy flush)
+	// that first post-failure probe happens immediately and starts the
+	// cooldown clock here — it is NOT skipped. The probe fails again
+	// (failFirstN=2), so the backend stays unhealthy.
 	p.Push(NewMetric("cpu").WithField("usage", 2.0))
-	if err := p.Flush(ctx); err != nil {
-		t.Fatalf("Flush #2 should be a no-op (skipped backend), got error: %v", err)
+	if err := p.Flush(ctx); err == nil {
+		t.Fatal("Flush #2 (first post-failure probe) should run and return the injected write error")
 	}
-	if got := backend.callCount(); got != 1 {
-		t.Fatalf("Flush #2: Write should NOT be called within RecoverInterval; call count = %d, want 1", got)
+	if got := backend.callCount(); got != 2 {
+		t.Fatalf("Flush #2: first post-failure flush must probe immediately; call count = %d, want 2", got)
+	}
+	if backend.Healthy() {
+		t.Fatal("Flush #2: backend should still be unhealthy after the failing recovery probe")
 	}
 
-	// --- Advance the clock just shy of RecoverInterval: still skipped.
+	// --- Advance the clock just shy of RecoverInterval: now the cooldown
+	// (started by the Flush #2 probe) gates the backend, so it is skipped.
 	advance(recover - time.Second)
 	p.Push(NewMetric("cpu").WithField("usage", 3.0))
 	if err := p.Flush(ctx); err != nil {
-		t.Fatalf("Flush #3 should still be skipped before RecoverInterval, got error: %v", err)
+		t.Fatalf("Flush #3 should be skipped before RecoverInterval elapses, got error: %v", err)
 	}
-	if got := backend.callCount(); got != 1 {
-		t.Fatalf("Flush #3: Write should still NOT be called before RecoverInterval; call count = %d, want 1", got)
+	if got := backend.callCount(); got != 2 {
+		t.Fatalf("Flush #3: Write should NOT be called before RecoverInterval; call count = %d, want 2", got)
 	}
 
 	// --- Advance past RecoverInterval: the pipeline must probe again. The
-	// fake recovers (its Write now succeeds and leaves healthy=true).
-	advance(2 * time.Second) // total elapsed since last attempt > RecoverInterval
+	// fake recovers (call #3 succeeds and leaves healthy=true).
+	advance(2 * time.Second) // total elapsed since the Flush #2 probe > RecoverInterval
 	p.Push(NewMetric("cpu").WithField("usage", 4.0))
 	if err := p.Flush(ctx); err != nil {
 		t.Fatalf("Flush #4 (after RecoverInterval) should probe and succeed, got error: %v", err)
 	}
-	if got := backend.callCount(); got != 2 {
-		t.Fatalf("Flush #4: Write should be re-attempted after RecoverInterval; call count = %d, want 2", got)
+	if got := backend.callCount(); got != 3 {
+		t.Fatalf("Flush #4: Write should be re-attempted after RecoverInterval; call count = %d, want 3", got)
 	}
 	if !backend.Healthy() {
 		t.Fatal("Flush #4: backend should be healthy again after successful recovery write")
@@ -149,8 +165,8 @@ func TestPipelineRecoverIntervalProbe(t *testing.T) {
 	if err := p.Flush(ctx); err != nil {
 		t.Fatalf("Flush #5 should deliver to the recovered backend, got error: %v", err)
 	}
-	if got := backend.callCount(); got != 3 {
-		t.Fatalf("Flush #5: recovered backend should keep receiving writes; call count = %d, want 3", got)
+	if got := backend.callCount(); got != 4 {
+		t.Fatalf("Flush #5: recovered backend should keep receiving writes; call count = %d, want 4", got)
 	}
 
 	if err := p.Stop(ctx); err != nil {

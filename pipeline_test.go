@@ -188,6 +188,9 @@ func TestPipelineDefaults(t *testing.T) {
 	if p.retryDelay != 1*time.Second {
 		t.Errorf("retryDelay = %v, want 1s", p.retryDelay)
 	}
+	if p.recoverInterval != 30*time.Second {
+		t.Errorf("recoverInterval = %v, want 30s", p.recoverInterval)
+	}
 }
 
 // retryBackend allows custom write behavior for testing.
