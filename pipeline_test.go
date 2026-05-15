@@ -200,8 +200,8 @@ type retryBackend struct {
 	writeFn func(ctx context.Context, metrics []*Metric) error
 }
 
-func (b *retryBackend) Name() string                                    { return b.name }
-func (b *retryBackend) Initialize(ctx context.Context) error            { return nil }
-func (b *retryBackend) Write(ctx context.Context, m []*Metric) error    { return b.writeFn(ctx, m) }
-func (b *retryBackend) Close() error                                    { return nil }
-func (b *retryBackend) Healthy() bool                                   { return b.healthy }
+func (b *retryBackend) Name() string                                 { return b.name }
+func (b *retryBackend) Initialize(ctx context.Context) error         { return nil }
+func (b *retryBackend) Write(ctx context.Context, m []*Metric) error { return b.writeFn(ctx, m) }
+func (b *retryBackend) Close() error                                 { return nil }
+func (b *retryBackend) Healthy() bool                                { return b.healthy }
