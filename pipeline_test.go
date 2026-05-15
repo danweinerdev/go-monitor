@@ -83,9 +83,10 @@ func TestPipelineSkipsUnhealthyBackend(t *testing.T) {
 	backend := &mockBackend{name: "test", healthy: false}
 
 	cfg := PipelineConfig{
-		BatchSize:     100,
-		FlushInterval: 1 * time.Hour,
-		RetryAttempts: 1,
+		BatchSize:       100,
+		FlushInterval:   1 * time.Hour,
+		RetryAttempts:   1,
+		RecoverInterval: 1 * time.Hour,
 	}
 	p := NewPipeline(cfg)
 	p.AddBackend(backend)
@@ -93,11 +94,23 @@ func TestPipelineSkipsUnhealthyBackend(t *testing.T) {
 	ctx := context.Background()
 	p.Start(ctx)
 
+	// First flush: the backend was never attempted, so the pipeline probes
+	// it once (this is the recovery attempt that breaks the old skip-forever
+	// deadlock). The mock never self-heals, so it stays unhealthy.
 	p.Push(NewMetric("cpu").WithField("usage", 42.5))
 	p.Flush(ctx)
 
-	if len(backend.written) != 0 {
-		t.Error("Unhealthy backend should be skipped")
+	if len(backend.written) != 1 {
+		t.Errorf("Unhealthy backend should be probed once on first flush, got %d writes", len(backend.written))
+	}
+
+	// Second flush within RecoverInterval: the backend is still unhealthy and
+	// was just attempted, so it must be skipped (no additional Write).
+	p.Push(NewMetric("cpu").WithField("usage", 43.5))
+	p.Flush(ctx)
+
+	if len(backend.written) != 1 {
+		t.Errorf("Unhealthy backend should be skipped within recovery interval, got %d writes", len(backend.written))
 	}
 
 	p.Stop(ctx)
@@ -175,6 +188,9 @@ func TestPipelineDefaults(t *testing.T) {
 	if p.retryDelay != 1*time.Second {
 		t.Errorf("retryDelay = %v, want 1s", p.retryDelay)
 	}
+	if p.recoverInterval != 30*time.Second {
+		t.Errorf("recoverInterval = %v, want 30s", p.recoverInterval)
+	}
 }
 
 // retryBackend allows custom write behavior for testing.
@@ -184,8 +200,8 @@ type retryBackend struct {
 	writeFn func(ctx context.Context, metrics []*Metric) error
 }
 
-func (b *retryBackend) Name() string                                    { return b.name }
-func (b *retryBackend) Initialize(ctx context.Context) error            { return nil }
-func (b *retryBackend) Write(ctx context.Context, m []*Metric) error    { return b.writeFn(ctx, m) }
-func (b *retryBackend) Close() error                                    { return nil }
-func (b *retryBackend) Healthy() bool                                   { return b.healthy }
+func (b *retryBackend) Name() string                                 { return b.name }
+func (b *retryBackend) Initialize(ctx context.Context) error         { return nil }
+func (b *retryBackend) Write(ctx context.Context, m []*Metric) error { return b.writeFn(ctx, m) }
+func (b *retryBackend) Close() error                                 { return nil }
+func (b *retryBackend) Healthy() bool                                { return b.healthy }

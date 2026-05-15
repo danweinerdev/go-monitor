@@ -9,37 +9,57 @@ import (
 
 // PipelineConfig configures the metric pipeline.
 type PipelineConfig struct {
-	BatchSize     int
-	FlushInterval time.Duration
-	RetryAttempts int
-	RetryDelay    time.Duration
-	Logger        *slog.Logger
+	BatchSize       int
+	FlushInterval   time.Duration
+	RetryAttempts   int
+	RetryDelay      time.Duration
+	RecoverInterval time.Duration // How often to retry unhealthy backends
+	Logger          *slog.Logger
 }
 
 // DefaultPipelineConfig returns sensible pipeline defaults.
 func DefaultPipelineConfig() PipelineConfig {
 	return PipelineConfig{
-		BatchSize:     10,
-		FlushInterval: 10 * time.Second,
-		RetryAttempts: 3,
-		RetryDelay:    1 * time.Second,
-		Logger:        slog.Default(),
+		BatchSize:       10,
+		FlushInterval:   10 * time.Second,
+		RetryAttempts:   3,
+		RetryDelay:      1 * time.Second,
+		RecoverInterval: 30 * time.Second,
+		Logger:          slog.Default(),
 	}
 }
 
 // Pipeline manages metric batching and delivery to backends.
 type Pipeline struct {
-	backends      []Backend
-	batchSize     int
-	flushInterval time.Duration
-	retryAttempts int
-	retryDelay    time.Duration
+	backends        []Backend
+	batchSize       int
+	flushInterval   time.Duration
+	retryAttempts   int
+	retryDelay      time.Duration
+	recoverInterval time.Duration
 
 	mu     sync.Mutex
 	buffer []*Metric
-	done   chan struct{}
-	wg     sync.WaitGroup
-	logger *slog.Logger
+	// lastAttempt maps a backend name to the time of its most recent
+	// recovery probe. An entry is written ONLY when the pipeline actually
+	// attempts a write to a backend that was unhealthy at the top of Flush
+	// (the recovery probe), never on an ordinary healthy flush. Consequently
+	// the recovery cooldown clock starts at the first probe after a backend
+	// goes unhealthy: that first post-failure flush probes immediately, and
+	// every subsequent probe is gated by recoverInterval from the prior
+	// probe. (This is deliberately stricter than recording on every flush,
+	// which would have started the cooldown at the last healthy flush and
+	// could make the first post-failure probe land earlier than
+	// recoverInterval.)
+	lastAttempt map[string]time.Time
+	done        chan struct{}
+	wg          sync.WaitGroup
+	logger      *slog.Logger
+
+	// now is the clock used for recovery-interval gating. It defaults to
+	// time.Now and is overridable in-package by tests for deterministic,
+	// sleep-free coverage of shouldAttemptRecovery.
+	now func() time.Time
 }
 
 // NewPipeline creates a new metric pipeline.
@@ -56,19 +76,25 @@ func NewPipeline(cfg PipelineConfig) *Pipeline {
 	if cfg.RetryDelay <= 0 {
 		cfg.RetryDelay = 1 * time.Second
 	}
+	if cfg.RecoverInterval <= 0 {
+		cfg.RecoverInterval = 30 * time.Second
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 
 	return &Pipeline{
-		backends:      make([]Backend, 0),
-		batchSize:     cfg.BatchSize,
-		flushInterval: cfg.FlushInterval,
-		retryAttempts: cfg.RetryAttempts,
-		retryDelay:    cfg.RetryDelay,
-		buffer:        make([]*Metric, 0, cfg.BatchSize),
-		done:          make(chan struct{}),
-		logger:        cfg.Logger,
+		backends:        make([]Backend, 0),
+		batchSize:       cfg.BatchSize,
+		flushInterval:   cfg.FlushInterval,
+		retryAttempts:   cfg.RetryAttempts,
+		retryDelay:      cfg.RetryDelay,
+		recoverInterval: cfg.RecoverInterval,
+		buffer:          make([]*Metric, 0, cfg.BatchSize),
+		lastAttempt:     make(map[string]time.Time),
+		done:            make(chan struct{}),
+		logger:          cfg.Logger,
+		now:             time.Now,
 	}
 }
 
@@ -150,9 +176,23 @@ func (p *Pipeline) Flush(ctx context.Context) error {
 
 	var lastErr error
 	for _, b := range p.backends {
-		if !b.Healthy() {
-			p.logger.Warn("skipping unhealthy backend", "backend", b.Name())
-			continue
+		wasUnhealthy := !b.Healthy()
+
+		if wasUnhealthy {
+			// Check if we should attempt recovery. A backend marked
+			// unhealthy heals itself at the top of Write, but the pipeline
+			// only reaches Write when it decides to probe — gate that probe
+			// on the recovery interval so a down backend is re-attempted
+			// periodically instead of being skipped forever. The decision
+			// and the recording of the probe timestamp are a single atomic
+			// step so two concurrent Flush calls cannot both probe the same
+			// backend within one cooldown.
+			if !p.shouldAttemptRecovery(b.Name()) {
+				p.logger.Debug("skipping unhealthy backend, waiting for recovery interval",
+					"backend", b.Name())
+				continue
+			}
+			p.logger.Info("attempting recovery for unhealthy backend", "backend", b.Name())
 		}
 
 		if err := p.writeWithRetry(ctx, b, batch); err != nil {
@@ -162,6 +202,30 @@ func (p *Pipeline) Flush(ctx context.Context) error {
 	}
 
 	return lastErr
+}
+
+// shouldAttemptRecovery decides whether an unhealthy backend should be probed
+// now and, if so, atomically records the probe timestamp before returning. The
+// check and the record happen under a single p.mu acquisition so that two
+// concurrent Flush calls (e.g. a batch-triggered flush racing the periodic
+// flushLoop) cannot both observe "interval elapsed" for the same backend and
+// double-probe it within one cooldown: the first caller records the timestamp,
+// the second sees it and is gated.
+//
+// It returns true (and records p.now() as the latest probe time) when the
+// backend has never been probed while unhealthy, or when at least
+// recoverInterval has elapsed since the last recorded probe. Otherwise it
+// returns false and leaves lastAttempt untouched.
+func (p *Pipeline) shouldAttemptRecovery(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	last, ok := p.lastAttempt[name]
+	if ok && p.now().Sub(last) < p.recoverInterval {
+		return false
+	}
+	p.lastAttempt[name] = p.now()
+	return true
 }
 
 func (p *Pipeline) writeWithRetry(ctx context.Context, b Backend, metrics []*Metric) error {

@@ -5,8 +5,9 @@ A shared Go library for building monitoring daemons. Provides the common infrast
 ## Features
 
 - **One-function interface**: Provide a `CollectFunc`, the library handles everything else
-- **Multiple backends**: InfluxDB 2.x, Prometheus exporter, echo (debug/stdout)
-- **Metrics pipeline**: Batched delivery with configurable retry and health-aware backend dispatch
+- **Multiple backends**: InfluxDB 2.x, Elasticsearch (bulk API), Prometheus exporter, echo (debug/stdout)
+- **Per-backend routing**: `MeasurementFilter` wraps any backend and forwards only metrics whose measurement matches configured include/exclude patterns
+- **Metrics pipeline**: Batched delivery with configurable retry and health-aware backend dispatch — an unhealthy backend is re-probed after `RecoverInterval` (default 30s) instead of being skipped permanently
 - **Signal handling**: SIGINT/SIGTERM for graceful shutdown, SIGHUP for config reload
 - **TOML configuration**: Structured config with validation and sensible defaults
 - **Structured logging**: slog-based with runtime-updatable log levels
@@ -52,6 +53,7 @@ Sub-packages are imported separately so unused backends don't add dependencies:
 
 ```bash
 go get github.com/danweinerdev/go-monitor/influxdb
+go get github.com/danweinerdev/go-monitor/elasticsearch
 go get github.com/danweinerdev/go-monitor/promexporter
 ```
 
@@ -146,6 +148,49 @@ m, err := monitor.New("mymonitor", collectFunc,
 )
 ```
 
+### Per-Backend Routing
+
+`MeasurementFilter` wraps any `Backend` and only forwards metrics whose
+measurement name matches its patterns. Patterns are exact strings or a single
+trailing `*` prefix wildcard (e.g. `"docsis_*"`); `Include` is an allowlist,
+`Exclude` is a denylist applied after it. Use it to send different measurements
+to different backends:
+
+```go
+import (
+    "github.com/danweinerdev/go-monitor"
+    "github.com/danweinerdev/go-monitor/elasticsearch"
+    "github.com/danweinerdev/go-monitor/influxdb"
+)
+
+influx := &monitor.MeasurementFilter{
+    Inner:   influxdb.New(influxCfg, nil),
+    Exclude: []string{"events"},          // metrics → InfluxDB, but not "events"
+}
+es := &monitor.MeasurementFilter{
+    Inner:   elasticsearch.New(esCfg, nil),
+    Include: []string{"events"},          // only "events" → Elasticsearch
+}
+
+m, err := monitor.New("mymonitor", collectFunc,
+    monitor.WithConfig(cfg),
+    monitor.WithBackend(influx),
+    monitor.WithBackend(es),
+)
+```
+
+The Elasticsearch backend writes via the bulk API and uses a configurable tag
+(`IDFromTag`, default `doc_id`) as the document `_id` for idempotent
+re-delivery; that tag is excluded from the document body.
+
+### Backend Health & Recovery
+
+The pipeline skips a backend whose `Healthy()` is false, but only until
+`RecoverInterval` (default 30s) has elapsed, then it sends one probe flush.
+Backends mark themselves healthy at the top of `Write` and unhealthy on
+failure, so a transient outage self-heals on the next probe instead of
+stranding the backend until restart.
+
 ### Poll Statistics
 
 ```go
@@ -172,7 +217,8 @@ fmt.Printf("Polls: %d, Metrics: %d\n", stats.TotalPolls, stats.TotalMetrics)
 go-monitor/
 ├── metric.go             # Metric data model + builder + line protocol
 ├── backend.go            # Backend interface + Echo + MultiBackend
-├── pipeline.go           # Batching pipeline with retry
+├── filter.go             # MeasurementFilter (per-backend measurement routing)
+├── pipeline.go           # Batching pipeline with retry + recover-interval probe
 ├── signal.go             # Signal handling (SIGINT/SIGTERM/SIGHUP)
 ├── config.go             # Config types + TOML loading + defaults
 ├── validation.go         # Validation framework
@@ -182,16 +228,19 @@ go-monitor/
 ├── monitor.go            # Core runtime (poll loop, signals, shutdown)
 ├── influxdb/
 │   └── influxdb.go       # InfluxDB v2 backend
+├── elasticsearch/
+│   └── elasticsearch.go  # Elasticsearch bulk-API backend
 └── promexporter/
     └── promexporter.go   # Prometheus exporter backend
 ```
 
-InfluxDB and Prometheus are isolated sub-packages so monitors that don't use them avoid pulling in those dependencies.
+InfluxDB, Elasticsearch, and Prometheus are isolated sub-packages so monitors that don't use them avoid pulling in those dependencies.
 
 ## Dependencies
 
 - [BurntSushi/toml](https://github.com/BurntSushi/toml) — TOML configuration
 - [InfluxDB Client](https://github.com/influxdata/influxdb-client-go) — InfluxDB 2.x (sub-package only)
+- [go-elasticsearch](https://github.com/elastic/go-elasticsearch) — Elasticsearch v8 (sub-package only)
 - [Prometheus Client](https://github.com/prometheus/client_golang) — Prometheus metrics (sub-package only)
 - `log/slog` — Structured logging (standard library)
 

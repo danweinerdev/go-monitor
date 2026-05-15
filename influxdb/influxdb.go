@@ -64,17 +64,30 @@ func (b *Backend) Initialize(ctx context.Context) error {
 }
 
 func (b *Backend) Write(ctx context.Context, metrics []*monitor.Metric) error {
+	// An empty batch is a no-op: do not touch health. Flipping healthy=true
+	// here would mark an uninitialized backend healthy without a writer.
 	if len(metrics) == 0 {
 		return nil
 	}
 
 	b.mu.RLock()
-	if b.writer == nil {
-		b.mu.RUnlock()
-		return fmt.Errorf("InfluxDB not initialized")
-	}
 	writer := b.writer
 	b.mu.RUnlock()
+
+	// An uninitialized backend has no writer: stay unhealthy and error so
+	// the pipeline does not treat this as a successful write.
+	if writer == nil {
+		b.markUnhealthy()
+		return fmt.Errorf("InfluxDB not initialized")
+	}
+
+	// Force healthy=true on the real write path, before the network call:
+	// the pipeline gates on Healthy() before calling Write, so a backend
+	// that stays false is never retried. This lets the next scheduled flush
+	// re-attempt. If this attempt fails we set healthy back to false below.
+	b.mu.Lock()
+	b.healthy = true
+	b.mu.Unlock()
 
 	points := make([]*write.Point, 0, len(metrics))
 	for _, m := range metrics {
@@ -88,18 +101,18 @@ func (b *Backend) Write(ctx context.Context, metrics []*monitor.Metric) error {
 	}
 
 	if err := writer.WritePoint(ctx, points...); err != nil {
-		b.mu.Lock()
-		b.healthy = false
-		b.mu.Unlock()
+		b.markUnhealthy()
 		return fmt.Errorf("failed to write to InfluxDB: %w", err)
 	}
 
-	b.mu.Lock()
-	b.healthy = true
-	b.mu.Unlock()
-
 	b.logger.Debug("wrote metrics to InfluxDB", "count", len(metrics))
 	return nil
+}
+
+func (b *Backend) markUnhealthy() {
+	b.mu.Lock()
+	b.healthy = false
+	b.mu.Unlock()
 }
 
 func (b *Backend) Close() error {
