@@ -275,12 +275,17 @@ func (b *Backend) markUnhealthy() {
 }
 
 func (b *Backend) Close() error {
+	// Snapshot and detach the client under the lock, then release the lock
+	// before the potentially-slow graceful close. Setting b.client = nil here
+	// prevents any concurrent re-use, so closing the snapshotted pointer after
+	// unlocking is safe and keeps Write()/Healthy() from blocking on the
+	// client's shutdown (a real contention hazard for multi-URL/discovery
+	// configs).
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	client := b.client
 	b.client = nil
 	b.healthy = false
+	b.mu.Unlock()
 
 	// Close the underlying client so its pooled TCP connections (and the
 	// custom InsecureTLS transport) are released across re-initialize
