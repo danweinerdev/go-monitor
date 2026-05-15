@@ -121,14 +121,8 @@ type bulkResponse struct {
 }
 
 func (b *Backend) Write(ctx context.Context, batch []*monitor.Metric) error {
-	// Force healthy=true at entry: the pipeline gates on Healthy() before
-	// calling Write, so a backend that stays false is never retried. This
-	// lets the next scheduled flush re-attempt. If this attempt fails we set
-	// healthy back to false at the end.
-	b.mu.Lock()
-	b.healthy = true
-	b.mu.Unlock()
-
+	// An empty batch is a no-op: do not touch health. Flipping healthy=true
+	// here would mark an uninitialized backend healthy without a client.
 	if len(batch) == 0 {
 		return nil
 	}
@@ -137,10 +131,20 @@ func (b *Backend) Write(ctx context.Context, batch []*monitor.Metric) error {
 	client := b.client
 	b.mu.RUnlock()
 
+	// An uninitialized backend has no client: stay unhealthy and error so
+	// the pipeline does not treat this as a successful write.
 	if client == nil {
 		b.markUnhealthy()
 		return fmt.Errorf("Elasticsearch not initialized")
 	}
+
+	// Force healthy=true on the real write path, before the network call:
+	// the pipeline gates on Healthy() before calling Write, so a backend
+	// that stays false is never retried. This lets the next scheduled flush
+	// re-attempt. If this attempt fails we set healthy back to false below.
+	b.mu.Lock()
+	b.healthy = true
+	b.mu.Unlock()
 
 	idTag := b.idTag()
 
@@ -152,12 +156,16 @@ func (b *Backend) Write(ctx context.Context, batch []*monitor.Metric) error {
 			id = m.Tags[idTag]
 		}
 
-		action := map[string]any{
-			"index": map[string]any{
-				"_index": b.cfg.Index,
-				"_id":    id,
-			},
+		// Build the index-meta map dynamically: omit "_id" entirely when
+		// it is empty so Elasticsearch auto-generates one. ES 8.x rejects an
+		// empty-string item-level _id with illegal_argument_exception, which
+		// would silently drop the metric. This mirrors esutil.BulkIndexer,
+		// which guards every _id write with `if DocumentID != ""`.
+		indexMeta := map[string]any{"_index": b.cfg.Index}
+		if id != "" {
+			indexMeta["_id"] = id
 		}
+		action := map[string]any{"index": indexMeta}
 		if err := enc.Encode(action); err != nil {
 			b.markUnhealthy()
 			return fmt.Errorf("failed to encode bulk action: %w", err)
@@ -207,6 +215,19 @@ func (b *Backend) Write(ctx context.Context, batch []*monitor.Metric) error {
 	}
 
 	if !parsed.Errors {
+		// Defensive: the top-level errors flag says all succeeded, but
+		// double-check item statuses in case the server contradicts itself.
+		// Log a warning if so; do not change the return.
+		for _, item := range parsed.Items {
+			for _, result := range item {
+				if result.Status < 200 || result.Status >= 300 {
+					b.logger.Warn("Elasticsearch reported errors:false but an item has a non-2xx status",
+						"_id", result.ID,
+						"status", result.Status,
+					)
+				}
+			}
+		}
 		b.logger.Debug("wrote metrics to Elasticsearch", "count", len(batch))
 		return nil
 	}
@@ -257,8 +278,18 @@ func (b *Backend) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	client := b.client
 	b.client = nil
 	b.healthy = false
+
+	// Close the underlying client so its pooled TCP connections (and the
+	// custom InsecureTLS transport) are released across re-initialize
+	// cycles. Tolerate a close error: log it, do not fail hard.
+	if client != nil {
+		if err := client.Close(context.Background()); err != nil {
+			b.logger.Warn("error closing Elasticsearch client", "err", err)
+		}
+	}
 
 	b.logger.Info("Elasticsearch connection closed")
 	return nil

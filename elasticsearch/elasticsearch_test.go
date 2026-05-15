@@ -131,8 +131,34 @@ func TestNewBackend(t *testing.T) {
 
 func TestWriteEmptyBatch(t *testing.T) {
 	b := New(Config{}, nil)
+	if b.Healthy() {
+		t.Fatal("backend should not be healthy before any write")
+	}
+
 	if err := b.Write(context.Background(), nil); err != nil {
+		t.Errorf("Write() with nil batch should not error, got %v", err)
+	}
+	if b.Healthy() {
+		t.Error("Write(nil) on an uninitialized backend must NOT flip healthy true")
+	}
+
+	if err := b.Write(context.Background(), []*monitor.Metric{}); err != nil {
 		t.Errorf("Write() with empty batch should not error, got %v", err)
+	}
+	if b.Healthy() {
+		t.Error("Write([]) on an uninitialized backend must NOT flip healthy true")
+	}
+}
+
+func TestWriteUninitializedNonEmptyBatch(t *testing.T) {
+	b := New(Config{}, nil)
+
+	err := b.Write(context.Background(), []*monitor.Metric{testMetric()})
+	if err == nil {
+		t.Fatal("Write() with a non-empty batch on an uninitialized backend must return an error")
+	}
+	if b.Healthy() {
+		t.Error("an uninitialized backend must stay unhealthy after a failed write")
 	}
 }
 
@@ -361,5 +387,70 @@ func TestWriteCustomIDFromTag(t *testing.T) {
 	}
 	if docs[0]["doc_id"] != "should-stay" {
 		t.Errorf("non-ID tag 'doc_id' should remain in the doc when IDFromTag is custom, got %v", docs[0])
+	}
+}
+
+// TestWriteOmitsEmptyID asserts that when a metric has no ID tag (or the tag
+// is present but empty), the emitted bulk action line carries NO "_id" key so
+// Elasticsearch auto-generates one. An empty-string item-level _id would be
+// rejected by ES 8.x and silently drop the metric.
+func TestWriteOmitsEmptyID(t *testing.T) {
+	cases := []struct {
+		name string
+		tags map[string]string
+	}{
+		{name: "no doc_id tag", tags: map[string]string{"host": "router"}},
+		{name: "doc_id tag present but empty", tags: map[string]string{"doc_id": "", "host": "router"}},
+		{name: "nil tags", tags: nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotBody []byte
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				esProductHeader(w)
+				if r.Method == http.MethodGet || r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				gotBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				// ES auto-generates an _id and returns success.
+				_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_id":"auto-generated","status":201}}]}`))
+			}))
+			defer srv.Close()
+
+			b, _ := newTestBackend(t, srv.URL, Config{})
+
+			m := monitor.NewMetric("mb8611_event")
+			m.Tags = tc.tags
+			m.Fields = map[string]any{"value": 1}
+			m.Timestamp = time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC)
+
+			if err := b.Write(context.Background(), []*monitor.Metric{m}); err != nil {
+				t.Fatalf("Write() must not error when ES returns success for an auto-id document, got %v", err)
+			}
+			if !b.Healthy() {
+				t.Error("backend should be healthy after a successful auto-id write")
+			}
+
+			actions, _ := parseBulk(t, gotBody)
+			if len(actions) != 1 {
+				t.Fatalf("expected 1 action/doc pair, got %d", len(actions))
+			}
+			idx, ok := actions[0]["index"].(map[string]any)
+			if !ok {
+				t.Fatalf("action line missing index object: %v", actions[0])
+			}
+			if idx["_index"] != "mb8611-events" {
+				t.Errorf("_index = %v, want mb8611-events", idx["_index"])
+			}
+			// The load-bearing assertion: the "_id" key must be ABSENT, not
+			// merely empty. parseBulk unmarshals the raw NDJSON, so a key
+			// written as "_id":"" would be present with value "".
+			if _, exists := idx["_id"]; exists {
+				t.Errorf("bulk action line must NOT contain an _id key when the metric has no ID, got %v", idx)
+			}
+		})
 	}
 }
